@@ -1,4 +1,7 @@
 import sqlite3
+import csv
+import io
+import parser as sightings_parser
 from flask import Flask, request, g
 from datetime import datetime
 import pandas as pd
@@ -200,6 +203,36 @@ def aggregates_by_region():
     items = [dict(row) for row in cur.fetchall()]
 
     return {'regions': items}
+
+
+@app.route('/upload_csv', methods=['POST'])
+def upload_csv():
+    """Upload a CSV file and ingest new sighting rows.
+    Expected columns: date, location, species (latinName optional).
+    Query params:
+      mode=replace   -> clears existing data before ingest
+    Response includes counts of processed, inserted, duplicate/invalid skipped.
+    """
+    file = request.files.get('file')
+    if file is None or file.filename == '':
+        return {'error': 'No file provided'}, 400
+    if not file.filename.lower().endswith('.csv'):
+        return {'error': 'File must be a .csv'}, 400
+
+    mode = request.args.get('mode', 'append').lower()
+    try:
+        raw_content = file.read()
+    except Exception as e:
+        return {'error': f'Failed to read file: {e}'}, 400
+    try:
+        text = raw_content.decode('utf-8-sig')
+    except Exception:
+        return {'error': 'Failed to decode file as UTF-8'}, 400
+
+    stats = sightings_parser.ingest_csv_content(raw_content, mode=mode, db_file=DATABASE)
+    if 'error' in stats:
+        return stats, 400
+    return stats
 
 @app.errorhandler(404)
 def not_found(error):

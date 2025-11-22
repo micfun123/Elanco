@@ -4,16 +4,57 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 from typing import Optional
+import os
 
 
 DATE_FORMAT = "%Y-%m-%dT%H:%M:%S"
 DATE_ONLY_FORMAT = "%Y-%m-%d"
-with open('TickSightings.csv', newline='') as csvfile:
+csv_path = os.path.join(os.path.dirname(__file__), 'TickSightings.csv')
+with open(csv_path, newline='') as csvfile:
     reader = csv.DictReader(csvfile)
-    data = [
-        {**row, 'date_obj': datetime.strptime(row['date'], DATE_FORMAT)}
-        for row in reader
-    ]
+    data = []
+    seen = set() 
+
+    for row in reader:
+        # Normalize and validate fields
+        date_raw = (row.get('date') or '').strip()
+        location = (row.get('location') or '').strip()
+        species = (row.get('species') or '').strip()
+
+        date_obj = None
+        if date_raw:
+            try:
+                date_obj = datetime.strptime(date_raw, DATE_FORMAT)
+            except ValueError:
+                try:
+                    dt = datetime.strptime(date_raw, DATE_ONLY_FORMAT)
+                    date_obj = datetime(dt.year, dt.month, dt.day, 0, 0, 0)
+                except ValueError:
+                    try:
+                        parsed = pd.to_datetime(date_raw)
+                        if hasattr(parsed, 'to_pydatetime'):
+                            date_obj = parsed.to_pydatetime()
+                        else:
+                            date_obj = datetime.fromtimestamp(parsed.astype('int64') // 10**9)
+                    except Exception:
+                        date_obj = None
+
+        if date_obj is None or not location:
+            continue
+
+        # Deduplicate based on normalized key: (date_iso, location_lower, species_lower)
+        dedupe_key = (date_obj.isoformat(), location.lower(), species.lower())
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        cleaned = {k: (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
+        cleaned['date'] = date_obj.strftime(DATE_FORMAT) 
+        cleaned['location'] = location
+        cleaned['species'] = species
+        cleaned['date_obj'] = date_obj
+
+        data.append(cleaned)
 
 app = Flask(__name__)
 
@@ -234,7 +275,6 @@ def aggregates_by_region():
 
     filtered_data = list(data)
 
-    # Reuse parsing logic from other endpoints
     def parse_datetime_param_local(s: Optional[str]) -> Optional[datetime]:
         if not s:
             return None

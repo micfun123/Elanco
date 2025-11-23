@@ -1,5 +1,7 @@
 import json
 from app import app
+import io
+
 
 
 def test_location_contains():
@@ -79,3 +81,20 @@ def test_aggregates_regions_with_filters():
     assert 'regions' in payload
     for r in payload['regions']:
         assert 'count' in r
+
+
+def test_upload_csv():
+    client = app.test_client()
+    csv_content = "date,location,species\n2035-01-01T10:00:00,Uploadville,Test tick\n2035-01-02T11:00:00,Uploadville,Test tick".encode('utf-8')
+    data = {
+        'file': (io.BytesIO(csv_content), 'new_upload.csv')
+    }
+    res = client.post('/upload_csv', data=data, content_type='multipart/form-data')
+    assert res.status_code == 200
+    payload = res.get_json()
+    assert payload['rows_inserted'] == 2
+    # Validate that at least one of the new rows is now queryable
+    res2 = client.get('/?location=Uploadville&location_match=exact&start=2035-01-01')
+    assert res2.status_code == 200
+    payload2 = res2.get_json()
+    assert len(payload2['results']) >= 2

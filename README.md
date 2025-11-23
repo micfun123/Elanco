@@ -1,90 +1,146 @@
-Tick Sightings API — Feature Summary
-====================================
+Tick Sightings API — Updated Feature Summary
+============================================
 
-This small Flask API provides access to tick sighting records from a CSV file `TickSightings.csv`. It's designed for quick filtering and simple analytics (time series trends and regional aggregates).
+This Flask API provides access to tick sighting records stored in a local SQLite database (`tick_sightings.db`). Data can be ingested from the shipped CSV (`TickSightings.csv`) using `parser.py` or uploaded dynamically via the `/upload_csv` endpoint. It supports filtering, analytics, anomaly detection, and optional LSTM-based forecasting.
 
-Key features
-----------------
-- Search & filtering by: location, species, and date/time ranges.
-- Flexible date parsing: accepts YYYY-MM-DD or ISO datetimes like YYYY-MM-DDTHH:MM:SS.
-- Location match modes: contains (default), prefix, or exact.
-- Pagination (limit + offset) for results and aggregates.
-- Trends endpoint with flexible resampling — daily, weekly, or monthly — and configurable moving average windows.
-- Aggregates per region (location) with filtering and pagination.
-- Helpful 404 handler that lists all available endpoints & methods.
+Core Features
+-------------
+- SQLite persistence instead of in-memory CSV.
+- CSV ingestion: initial load via `parser.py` or runtime upload (`/upload_csv`).
+- Filtering by location (match modes), species, and date/time ranges.
+- Time-series trends with resampling (daily / weekly / monthly) and moving averages.
+- Regional aggregate counts.
+- Statistical anomaly detection for recent activity (`/insights/anomalies`).
+- Optional LSTM forecast and evaluation endpoints (`/ml/forecast`, `/ml/evaluate`).
+- Endpoint index at `/` (returns available endpoints JSON). 404 handler also returns endpoint listings.
 
-Endpoints & Usage
-----------------------
-1) GET /
-   - Purpose: List raw sighting records.
-   - Query params (all optional):
-     - `location` — substring to match location (case-insensitive)
-     - `location_match` — one of `contains` (default), `prefix`, `exact`
-     - `species` — substring match for species
-     - `start` or `datetime_start` — start date (YYYY-MM-DD or ISO), inclusive
-     - `end` or `datetime_end` — end date (YYYY-MM-DD or ISO), inclusive
-     - `limit` — max number of results to return (integer)
-     - `offset` — number of rows to skip (integer)
-   - Example: curl "http://127.0.0.1:5000/?location=Glasgow&start=2018-01-01&end=2019-01-01&limit=10"
+Data Model & Storage
+--------------------
+SQLite table `sightings` columns:
+- `id` INTEGER PRIMARY KEY AUTOINCREMENT
+- `date` TEXT (ISO timestamp `YYYY-MM-DDTHH:MM:SS`)
+- `location` TEXT
+- `species` TEXT
+- `latinName` TEXT (optional)
 
-2) GET /trends
-   - Purpose: Return time-series trends — counts per sample interval, plus moving average.
-   - Query params:
-     - `location` / `location_match` — same behaviour as `/`
-     - `species` — filter for species
-     - `start` / `datetime_start`, `end` / `datetime_end` — filter by dates
-     - `interval` — resample frequency: `daily` (or `D`), `weekly` (`W`), `monthly` (`M`) — default `daily`
-     - `window` — moving average window in units of chosen `interval` (defaults to `7` for daily, `4` for weekly, `3` for monthly)
-   - Example: curl "http://127.0.0.1:5000/trends?location=Nottingham&interval=weekly"
+CSV expected columns for ingestion: `date, location, species` (optional `latinName`). Deduplication uses key `(date_iso, lower(location), lower(species))`.
 
-3) GET /aggregates/regions
-   - Purpose: Count of sightings per region (location), with filters
-   - Query params:
-     - `species` — filter species
-     - `location` — filter region (return counts for matching regions only)
-     - `start` / `datetime_start`, `end` / `datetime_end` — limit the range before aggregation
-     - `limit`, `offset` — pagination for returned regions
-   - Example: curl "http://127.0.0.1:5000/aggregates/regions?species=Marsh%20tick&start=2022-01-01&limit=5"
+Endpoints Overview
+------------------
+1. `GET /` — Returns a JSON list of all available endpoints and their HTTP methods.
 
-4) 404 responses
-   - Unrecognized endpoints return HTTP 404 and a JSON listing available endpoints and methods. That's helpful for discovery and test automation.
+2. `GET /data` — List raw sighting records.
+  Query params (all optional):
+  - `location`, `location_match` = contains | prefix | exact
+  - `species`
+  - `start` / `datetime_start`, `end` / `datetime_end`
+  - `limit` (default 100), `offset`
+  Example:
+  ```bash
+  curl "http://127.0.0.1:5000/data?location=Glasgow&start=2018-01-01&end=2019-01-01&limit=10"
+  ```
 
-How queries & parsing behave
---------------------------------
-- Date/time: The API accepts both `YYYY-MM-DD` (interpreted as start-of-day in UTC) and `YYYY-MM-DDTHH:MM:SS` or other parsable ISO datetimes (via Pandas parsing). If a param cannot be parsed, the API returns 400 with an error message.
-- Match modes for `location`: 
-  - contains (default): a substring search, case-insensitive
-  - prefix: location starts with the provided string
-  - exact: full match (case-insensitive)
-- Pagination: `limit` and `offset` are applied at the end of the `GET /` or `/aggregates/regions` flows.
+3. `GET /trends` — Time-series counts + moving average.
+  Params: same filters as `/data` plus:
+  - `interval` = daily|weekly|monthly|D|W|M (default `D`)
+  - `window` = moving average size (defaults: 7 for D, 4 for W, 3 for M)
+  ```bash
+  curl "http://127.0.0.1:5000/trends?location=Nottingham&interval=weekly"
+  ```
 
-Running & Testing
-----------------------
-1) Install dependencies (recommended in a virtualenv):
+4. `GET /aggregates/regions` — Count of sightings per location.
+  Filters: `location`, `species`, date range, pagination (`limit`, `offset`).
+  ```bash
+  curl "http://127.0.0.1:5000/aggregates/regions?species=Marsh%20tick&start=2022-01-01&limit=5"
+  ```
+
+5. `POST /upload_csv` — Upload and ingest a CSV file.
+  - Multipart form field: `file` (CSV)
+  - Query param: `mode=replace` to clear existing data before ingest (default `append`).
+  Returns ingestion statistics: `rows_total`, `rows_inserted`, `rows_skipped_invalid`, `rows_skipped_duplicate`.
+  Example:
+  ```bash
+  curl -F file=@TickSightings.csv http://127.0.0.1:5000/upload_csv
+  ```
+
+6. `GET /insights/anomalies` — Detects unusual activity (z-score > 2) over a recent window.
+  - Param: `days` (default 30)
+  Returns flagged days with counts and severity.
+  ```bash
+  curl "http://127.0.0.1:5000/insights/anomalies?days=45"
+  ```
+
+7. `GET /ml/forecast` — LSTM-based forecast of future sighting counts.
+  - Params: `location`, `species`, `days` (forecast horizon up to 30)
+  - Requires a pre-trained model file at `models/lstm_<location or all>_<species or all>.pth`.
+  - Response includes predicted counts per future day and metadata.
+
+8. `GET /ml/evaluate` — Returns configuration/details of a trained model for a given location/species combination.
+
+9. 404 — Any unknown path returns JSON with `available_endpoints` for discoverability.
+
+Query & Parsing Behavior
+------------------------
+- Dates accept `YYYY-MM-DD` (interpreted start-of-day) or `YYYY-MM-DDTHH:MM:SS`; other ISO-like formats parsed by Pandas where possible.
+- Location matching: `contains` (default substring), `prefix`, `exact` (case-insensitive logic via LIKE or equality).
+- Pagination: `limit` and `offset` applied directly in SQL for performance.
+- CSV uploads: duplicates skipped using the composite dedupe key to prevent noisy duplicates.
+
+Initial Data Load
+-----------------
+Option 1: Run parser to build the database fresh:
+```bash
+python parser.py  # creates tick_sightings.db from TickSightings.csv
+```
+Option 2: Start the API and upload a CSV via `/upload_csv`.
+
+Anomaly Detection Details
+-------------------------
+For each location, daily counts over the last `days` (default 30) are collected. A z-score is computed against that location's mean & std deviation; days with z-score > 2 are flagged (`severity` escalates to `high` above 3).
+
+Forecasting (LSTM)
+------------------
+The LSTM expects a model file produced by `train_lstm_model` in `ml.py`. Training outline:
+1. Aggregate historical daily counts per location/species.
+2. Call `train_lstm_model(df, target_column='count', lookback=7, ...)` to produce a `.pth` file.
+3. Name the file `models/lstm_<location or all>_<species or all>.pth` so `/ml/forecast` can locate it.
+4. Forecast endpoint performs autoregressive prediction for up to `days` future steps (default 14, max 30).
+
+Dependencies
+------------
+Base (in `requirements.txt`): Flask, pandas, numpy, pytest.
+Additional for advanced features:
+- `scipy` (installed for statistical operations if needed)
+- `torch` (PyTorch for LSTM modeling)
+- `scikit-learn` (MinMaxScaler used in `ml.py`)
+
+To install base + extras:
 ```bash
 python -m pip install -r requirements.txt
+python -m pip install torch scikit-learn scipy
 ```
 
-2) Run the app (development mode):
-```bash
-python app.py
-# or: export FLASK_APP=app.py && flask run
-```
-
-3) Run tests with pytest:
+Testing
+-------
 ```bash
 python -m pytest
 ```
+Add tests for new endpoints (upload, anomalies, forecast) as needed under `tests/`.
 
-Data source & format
------------------------
-- The app loads `TickSightings.csv` at startup. The CSV must have these columns: 
-  `id`, `date` (as ISO string), `location`, `species`, `latinName`.
-- The sample data included is already used for default filtering.
+Security & Operational Notes
+----------------------------
+- File upload is limited to `.csv` by extension check; consider MIME/type validation for production.
+- No authentication is currently implemented; restrict network exposure if running with sensitive data.
+- Forecasting depends on presence of model files; handle missing models gracefully (already returns 404 with hint).
 
-Implementation notes
-------------------------
-- The app kept in `app.py` uses an in-memory CSV read on startup and adds a `date_obj` field (python datetime) for fast comparisons.
-- Pandas is used for the time-series resampling and aggregation logic.
-- Endpoints return JSON-friendly, consistent result shapes for easy client integration.
+Future Improvements
+-------------------
+- Add `/ml/train` endpoint to trigger on-demand model training.
+- Implement caching for heavy aggregate queries.
+- Add authentication & rate limiting for upload and ML endpoints.
+- Integrate more robust anomaly detection (e.g., STL decomposition, seasonal baselines).
+
+License
+-------
+Internal/informal usage; add a license file if distributing externally.
 

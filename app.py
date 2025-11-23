@@ -1,9 +1,16 @@
 import sqlite3
+import csv
+import io
+import parser as sightings_parser
 from flask import Flask, request, g
 from datetime import datetime
 import pandas as pd
 from typing import Optional
+import numpy as np
+from scipy import stats
 import os
+from datetime import timedelta
+from ml import load_lstm_model, predict_future
 
 app = Flask(__name__)
 
@@ -88,8 +95,25 @@ def build_filters(request_args):
 
     return conditions, params
 
+
 @app.route('/')
 def index():
+    endpoints = []
+    for rule in app.url_map.iter_rules():
+        if rule.endpoint == 'static':
+            continue
+        endpoints.append({
+            'endpoint': rule.endpoint,
+            'methods': sorted([m for m in rule.methods if m not in ['HEAD', 'OPTIONS']]),
+            'rule': str(rule)
+        })
+    return {
+        'available_endpoints': sorted(endpoints, key=lambda e: (e['rule'], e['endpoint']))
+    }
+
+
+@app.route('/data')
+def data():
     conditions, params = build_filters(request.args)
     
     # Pagination logic
@@ -201,6 +225,91 @@ def aggregates_by_region():
 
     return {'regions': items}
 
+
+@app.route('/upload_csv', methods=['POST'])
+def upload_csv():
+    """Upload a CSV file and ingest new sighting rows.
+    Expected columns: date, location, species (latinName optional).
+    Query params:
+      mode=replace   -> clears existing data before ingest
+    Response includes counts of processed, inserted, duplicate/invalid skipped.
+    """
+    file = request.files.get('file')
+    if file is None or file.filename == '':
+        return {'error': 'No file provided'}, 400
+    if not file.filename.lower().endswith('.csv'):
+        return {'error': 'File must be a .csv'}, 400
+
+    mode = request.args.get('mode', 'append').lower()
+    try:
+        raw_content = file.read()
+    except Exception as e:
+        return {'error': f'Failed to read file: {e}'}, 400
+    try:
+        text = raw_content.decode('utf-8-sig')
+    except Exception:
+        return {'error': 'Failed to decode file as UTF-8'}, 400
+
+    stats = sightings_parser.ingest_csv_content(raw_content, mode=mode, db_file=DATABASE)
+    if 'error' in stats:
+        return stats, 400
+    return stats
+
+
+@app.route('/insights/anomalies')
+def detect_anomalies():
+    """
+    Detect unusual tick activity using statistical methods.
+    Flags locations with sightings significantly above normal.
+    """
+    days_back = int(request.args.get('days', 30))
+    
+    # Get daily counts by location
+    query = """
+        SELECT 
+            location,
+            date(date) as day,
+            COUNT(*) as daily_count
+        FROM sightings
+        WHERE date >= date('now', '-' || ? || ' days')
+        GROUP BY location, day
+    """
+    
+    df = pd.read_sql_query(query, get_db(), params=[days_back])
+    
+    anomalies = []
+    
+    # For each location, detect outliers using z-score
+    for location in df['location'].unique():
+        loc_data = df[df['location'] == location]
+        counts = loc_data['daily_count'].values
+        
+        if len(counts) < 7:  # Need minimum data
+            continue
+        
+        mean = np.mean(counts)
+        std = np.std(counts)
+        
+        # Find days with z-score > 2 (unusual)
+        for _, row in loc_data.iterrows():
+            z_score = (row['daily_count'] - mean) / (std + 0.001)
+            
+            if z_score > 2:  # Significantly above average
+                anomalies.append({
+                    'location': location,
+                    'date': row['day'],
+                    'sighting_count': int(row['daily_count']),
+                    'expected_count': round(mean, 1),
+                    'severity': 'high' if z_score > 3 else 'medium',
+                    'z_score': round(z_score, 2)
+                })
+    
+    return {
+        'anomalies_detected': len(anomalies),
+        'analysis_period_days': days_back,
+        'alerts': sorted(anomalies, key=lambda x: x['z_score'], reverse=True)
+    }
+
 @app.errorhandler(404)
 def not_found(error):
     endpoints = []
@@ -216,6 +325,130 @@ def not_found(error):
         'error': 'Not found',
         'available_endpoints': sorted(endpoints, key=lambda e: (e['rule'], e['endpoint']))
     }, 404
+
+
+
+app.route('/ml/forecast', methods=['GET'])
+def lstm_forecast():
+    """
+    Forecast future tick sightings using trained LSTM.
+    
+    Query params:
+        - location: Filter by location
+        - species: Filter by species
+        - days: Number of days to forecast (default: 14, max: 30)
+    """
+    location = request.args.get('location')
+    species = request.args.get('species')
+    forecast_days = min(int(request.args.get('days', 14)), 30)
+    
+    try:
+        model_path = f'models/lstm_{location or "all"}_{species or "all"}.pth'
+        
+        if not os.path.exists(model_path):
+            return {
+                'error': 'Model not found. Train the model first using POST /ml/train',
+                'hint': f'Expected model at: {model_path}'
+            }, 404
+        
+        # Load model
+        model, scaler, config = load_lstm_model(model_path)
+        lookback = config['lookback']
+        
+        # Get recent data
+        query = """
+            SELECT date(date) as day, COUNT(*) as count
+            FROM sightings
+        """
+        conditions = []
+        params = []
+        
+        if location:
+            conditions.append("location LIKE ?")
+            params.append(f'%{location}%')
+        if species:
+            conditions.append("species LIKE ?")
+            params.append(f'%{species}%')
+        
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        
+        query += " GROUP BY day ORDER BY day DESC LIMIT ?"
+        params.append(lookback)
+        
+        df = pd.read_sql_query(query, get_db(), params=params)
+        
+        if len(df) < lookback:
+            return {
+                'error': f'Insufficient recent data (have {len(df)} days, need {lookback})'
+            }, 400
+        
+        # Get last sequence (reverse order since we selected DESC)
+        last_sequence = df['count'].values[::-1]
+        
+        # Get last date
+        df['day'] = pd.to_datetime(df['day'])
+        last_date = df['day'].max()
+        
+        # Predict future
+        import torch
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        predictions = predict_future(model, scaler, last_sequence, forecast_days, device)
+        
+        # Format response
+        forecast_data = []
+        for i, pred_count in enumerate(predictions):
+            forecast_date = last_date + timedelta(days=i+1)
+            forecast_data.append({
+                'date': forecast_date.strftime(DATE_FORMAT),
+                'predicted_count': max(0, round(float(pred_count), 2)),
+                'confidence': 'high' if i < 7 else 'medium' if i < 14 else 'low'
+            })
+        
+        return {
+            'location': location or 'all',
+            'species': species or 'all',
+            'forecast_days': forecast_days,
+            'model_type': 'LSTM',
+            'model_config': config,
+            'forecast': forecast_data,
+            'metadata': {
+                'last_actual_date': last_date.strftime(DATE_FORMAT),
+                'last_actual_count': int(last_sequence[-1]),
+                'model_path': model_path
+            }
+        }
+        
+    except Exception as e:
+        return {'error': str(e)}, 500
+
+
+@app.route('/ml/evaluate', methods=['GET'])
+def evaluate_lstm():
+    """Evaluate trained LSTM model performance."""
+    location = request.args.get('location')
+    species = request.args.get('species')
+    
+    try:
+        model_path = f'models/lstm_{location or "all"}_{species or "all"}.pth'
+        
+        if not os.path.exists(model_path):
+            return {'error': 'Model not found'}, 404
+        
+        # Load model
+        model, scaler, config = load_lstm_model(model_path)
+        
+        # This would require re-loading and splitting the training data
+        # For simplicity, return model info
+        return {
+            'model_path': model_path,
+            'config': config,
+            'status': 'Model evaluation would require re-running training data split'
+        }
+        
+    except Exception as e:
+        return {'error': str(e)}, 500
+
 
 if __name__ == "__main__":
     if not os.path.exists(DATABASE):

@@ -6,6 +6,8 @@ from flask import Flask, request, g
 from datetime import datetime
 import pandas as pd
 from typing import Optional
+import numpy as np
+from scipy import stats
 import os
 
 app = Flask(__name__)
@@ -91,8 +93,25 @@ def build_filters(request_args):
 
     return conditions, params
 
+
 @app.route('/')
 def index():
+    endpoints = []
+    for rule in app.url_map.iter_rules():
+        if rule.endpoint == 'static':
+            continue
+        endpoints.append({
+            'endpoint': rule.endpoint,
+            'methods': sorted([m for m in rule.methods if m not in ['HEAD', 'OPTIONS']]),
+            'rule': str(rule)
+        })
+    return {
+        'available_endpoints': sorted(endpoints, key=lambda e: (e['rule'], e['endpoint']))
+    }
+
+
+@app.route('/data')
+def data():
     conditions, params = build_filters(request.args)
     
     # Pagination logic
@@ -233,6 +252,61 @@ def upload_csv():
     if 'error' in stats:
         return stats, 400
     return stats
+
+
+@app.route('/insights/anomalies')
+def detect_anomalies():
+    """
+    Detect unusual tick activity using statistical methods.
+    Flags locations with sightings significantly above normal.
+    """
+    days_back = int(request.args.get('days', 30))
+    
+    # Get daily counts by location
+    query = """
+        SELECT 
+            location,
+            date(date) as day,
+            COUNT(*) as daily_count
+        FROM sightings
+        WHERE date >= date('now', '-' || ? || ' days')
+        GROUP BY location, day
+    """
+    
+    df = pd.read_sql_query(query, get_db(), params=[days_back])
+    
+    anomalies = []
+    
+    # For each location, detect outliers using z-score
+    for location in df['location'].unique():
+        loc_data = df[df['location'] == location]
+        counts = loc_data['daily_count'].values
+        
+        if len(counts) < 7:  # Need minimum data
+            continue
+        
+        mean = np.mean(counts)
+        std = np.std(counts)
+        
+        # Find days with z-score > 2 (unusual)
+        for _, row in loc_data.iterrows():
+            z_score = (row['daily_count'] - mean) / (std + 0.001)
+            
+            if z_score > 2:  # Significantly above average
+                anomalies.append({
+                    'location': location,
+                    'date': row['day'],
+                    'sighting_count': int(row['daily_count']),
+                    'expected_count': round(mean, 1),
+                    'severity': 'high' if z_score > 3 else 'medium',
+                    'z_score': round(z_score, 2)
+                })
+    
+    return {
+        'anomalies_detected': len(anomalies),
+        'analysis_period_days': days_back,
+        'alerts': sorted(anomalies, key=lambda x: x['z_score'], reverse=True)
+    }
 
 @app.errorhandler(404)
 def not_found(error):

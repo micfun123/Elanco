@@ -7,7 +7,6 @@ from datetime import datetime
 import pandas as pd
 from typing import Optional
 import numpy as np
-from scipy import stats
 import os
 from sklearn.ensemble import RandomForestRegressor
 from datetime import timedelta

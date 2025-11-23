@@ -73,6 +73,4 @@ python -m pytest
 **Future Work**
 - Add authenticated endpoints, background training tasks, caching for heavy queries, and more robust anomaly detection methods.
 
-**License**
-- Internal/informal usage. Add a `LICENSE` file before public distribution.
 

@@ -3,6 +3,8 @@ Tick Sightings API
 
 Lightweight Flask API for managing, querying, and analyzing tick sighting records stored in a local SQLite database (`tick_sightings.db`). It provides CSV ingestion, flexible filters, time-series trends, regional aggregates, anomaly detection, and optional ML forecasting.
 
+Video Demo [https://youtu.be/OtE3PJ5qe7E](https://youtu.be/OtE3PJ5qe7E)
+
 **Quick Start**
 - **Install dependencies**:
 ```bash

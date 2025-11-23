@@ -1,6 +1,6 @@
 import sqlite3
 import csv
-import io
+import joblib
 import parser as sightings_parser
 from flask import Flask, request, g
 from datetime import datetime
@@ -9,7 +9,7 @@ from typing import Optional
 import numpy as np
 from scipy import stats
 import os
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestRegressor
 from datetime import timedelta
 
 app = Flask(__name__)
@@ -112,7 +112,7 @@ def data():
     
     # Pagination logic
     try:
-        limit = int(request.args.get('limit', 100)) # Default limit 100
+        limit = int(request.args.get('limit', 100))
         offset = int(request.args.get('offset', 0))
     except ValueError:
         return {'error': 'Limit and offset must be integers'}, 400
@@ -156,7 +156,7 @@ def trends():
     
     counts = df.resample(interval).size()
 
-    # Moving Average Logic
+    # Moving Average
     try:
         window_param = int(request.args.get('window')) if request.args.get('window') else None
     except ValueError:
@@ -206,7 +206,6 @@ def aggregates_by_region():
         query += " LIMIT ? OFFSET ?"
         params.extend([limit, offset])
     elif offset:
-        # SQLite requires LIMIT if OFFSET is present; use -1 for 'no limit'
         query += " LIMIT -1 OFFSET ?"
         params.append(offset)
 
@@ -300,44 +299,111 @@ def detect_anomalies():
         'alerts': sorted(anomalies, key=lambda x: x['z_score'], reverse=True)
     }
 
-
-@app.route('/predict/<location>/<species>')
-def predict_sightings(location, species):
-
+def train_rf_model(location: str, model_path: str):
     """
-    Predict future tick sightings RandomForestClassifier model.
-    Query params:
-      days_ahead=30   -> number of days to predict into the future
+    Trains a RandomForestRegressor on historical daily counts for a LOCATION only.
+    Aggregates all species together.
     """
+    loc = (location or '').strip()
+    MIN_POINTS = 14
 
+    conn = get_db()
+    
+    try:
+        # Exact match on location
+        q_exact = """
+            SELECT date(date) as day, COUNT(*) as cnt
+            FROM sightings
+            WHERE LOWER(location) = LOWER(?)
+            GROUP BY day
+            ORDER BY day
+        """
+        df = pd.read_sql_query(q_exact, conn, params=[loc])
+        
+        # Fallback to LIKE match if exact is too sparse
+        if df.empty or len(df) < MIN_POINTS:
+            q_like = """
+                SELECT date(date) as day, COUNT(*) as cnt
+                FROM sightings
+                WHERE location LIKE ?
+                GROUP BY day
+                ORDER BY day
+            """
+            df_like = pd.read_sql_query(q_like, conn, params=[f"%{loc}%"])
+            if len(df_like) >= MIN_POINTS:
+                df = df_like
+    except Exception as e:
+        return {'error': f'Failed to read historical data: {e}'}
+
+    if df.empty or len(df) < MIN_POINTS:
+        return {'error': 'Not enough historical data to train model (need >= 14 days of activity)'}
+
+   
+    df['day_dt'] = pd.to_datetime(df['day'])
+    df = df.set_index('day_dt').sort_index()
+    
+
+    full_range = pd.date_range(start=df.index.min(), end=df.index.max(), freq='D')
+    df = df.reindex(full_range, fill_value=0)
+    
+    # 7-day rolling average
+    df['rolling_avg'] = df['cnt'].rolling(window=7, min_periods=1).mean()
+    
+    df['doy'] = df.index.dayofyear
+    X = df[['doy']].values
+    y = df['rolling_avg'].values
+
+    try:
+        model = RandomForestRegressor(n_estimators=100, random_state=42)
+        model.fit(X, y)
+        joblib.dump(model, model_path)
+        return {'trained': True, 'rows_used': int(len(df)), 'model_path': model_path}
+    except Exception as e:
+        return {'error': f'Failed to train/save model: {e}'}
+
+
+@app.route('/predict/<location>')
+def predict_sightings(location):
+    """
+    Predicts aggregate tick activity for a location (ignoring species).
+    """
     days_ahead = int(request.args.get('days_ahead', 30))
-    model_path = f"models/rf_{location.replace(' ', '_')}_{species.replace(' ', '_')}.pkl"
+    model_path = f"models/rf_{location.replace(' ', '_')}_ALL.pkl"
+    
     if not os.path.exists(model_path):
-        return {'error': f'No model found for {location} and {species}'}, 404
+        try:
+            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+            train_result = train_rf_model(location, model_path)
+            if 'error' in train_result:
+                return train_result, 404
+        except Exception as e:
+            return {'error': f'Failed to train model: {e}'}, 500
 
-    # Load model
-    import joblib
-    model = joblib.load(model_path)
+    try:
+        model = joblib.load(model_path)
+    except Exception:
+        train_rf_model(location, model_path)
+        model = joblib.load(model_path)
 
     future_dates = [datetime.now() + timedelta(days=i) for i in range(1, days_ahead + 1)]
-    features = np.array([[d.timetuple().tm_yday] for d in future_dates])
+    future_features = np.array([[d.timetuple().tm_yday] for d in future_dates])
+    predictions = model.predict(future_features)
 
-    # Predict
-    predictions = model.predict(features)
-
-    prediction_results = [
+    results = [
         {
-            'date': (datetime.now() + timedelta(days=i)).strftime(DATE_ONLY_FORMAT),
-            'predicted_sightings': int(predictions[i - 1])
+            'date': d.strftime(DATE_ONLY_FORMAT),
+            'predicted_sightings': round(float(pred), 2)
         }
-        for i in range(1, days_ahead + 1)
+        for d, pred in zip(future_dates, predictions)
     ]
 
     return {
         'location': location,
-        'species': species,
-        'predictions': prediction_results
+        'scope': 'All Species',
+        'model_type': 'RandomForest (7-day Rolling Avg)',
+        'predictions': results
     }
+   
 
 @app.errorhandler(404)
 def not_found(error):

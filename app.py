@@ -9,8 +9,8 @@ from typing import Optional
 import numpy as np
 from scipy import stats
 import os
+from sklearn.ensemble import RandomForestClassifier
 from datetime import timedelta
-from ml import load_lstm_model, predict_future
 
 app = Flask(__name__)
 
@@ -25,12 +25,6 @@ def get_db():
         db = g._database = sqlite3.connect(DATABASE)
         db.row_factory = sqlite3.Row
     return db
-
-@app.teardown_appcontext
-def close_connection(exception):
-    db = getattr(g, '_database', None)
-    if db is not None:
-        db.close()
 
 def parse_datetime_param(s: Optional[str]) -> Optional[datetime]:
     """Helper to parse input query params into datetime objects."""
@@ -138,9 +132,6 @@ def data():
 @app.route('/trends')
 def trends():
     conditions, params = build_filters(request.args)
-    
-    # We fetch only the date column for trends to keep it light, 
-    # unless you need other columns for complex filtering not handled by SQL.
     query = "SELECT date FROM sightings"
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
@@ -159,7 +150,6 @@ def trends():
     df['date_obj'] = pd.to_datetime(df['date'])
     df.set_index('date_obj', inplace=True)
 
-    # Resampling Logic
     interval_str = request.args.get('interval', 'D')
     interval_map = {'daily': 'D', 'weekly': 'W', 'monthly': 'M', 'd': 'D', 'w': 'W', 'm': 'M'}
     interval = interval_map.get(interval_str.lower(), 'D')
@@ -310,6 +300,45 @@ def detect_anomalies():
         'alerts': sorted(anomalies, key=lambda x: x['z_score'], reverse=True)
     }
 
+
+@app.route('/predict/<location>/<species>')
+def predict_sightings(location, species):
+
+    """
+    Predict future tick sightings RandomForestClassifier model.
+    Query params:
+      days_ahead=30   -> number of days to predict into the future
+    """
+
+    days_ahead = int(request.args.get('days_ahead', 30))
+    model_path = f"models/rf_{location.replace(' ', '_')}_{species.replace(' ', '_')}.pkl"
+    if not os.path.exists(model_path):
+        return {'error': f'No model found for {location} and {species}'}, 404
+
+    # Load model
+    import joblib
+    model = joblib.load(model_path)
+
+    future_dates = [datetime.now() + timedelta(days=i) for i in range(1, days_ahead + 1)]
+    features = np.array([[d.timetuple().tm_yday] for d in future_dates])
+
+    # Predict
+    predictions = model.predict(features)
+
+    prediction_results = [
+        {
+            'date': (datetime.now() + timedelta(days=i)).strftime(DATE_ONLY_FORMAT),
+            'predicted_sightings': int(predictions[i - 1])
+        }
+        for i in range(1, days_ahead + 1)
+    ]
+
+    return {
+        'location': location,
+        'species': species,
+        'predictions': prediction_results
+    }
+
 @app.errorhandler(404)
 def not_found(error):
     endpoints = []
@@ -325,130 +354,7 @@ def not_found(error):
         'error': 'Not found',
         'available_endpoints': sorted(endpoints, key=lambda e: (e['rule'], e['endpoint']))
     }, 404
-
-
-
-app.route('/ml/forecast', methods=['GET'])
-def lstm_forecast():
-    """
-    Forecast future tick sightings using trained LSTM.
-    
-    Query params:
-        - location: Filter by location
-        - species: Filter by species
-        - days: Number of days to forecast (default: 14, max: 30)
-    """
-    location = request.args.get('location')
-    species = request.args.get('species')
-    forecast_days = min(int(request.args.get('days', 14)), 30)
-    
-    try:
-        model_path = f'models/lstm_{location or "all"}_{species or "all"}.pth'
-        
-        if not os.path.exists(model_path):
-            return {
-                'error': 'Model not found. Train the model first using POST /ml/train',
-                'hint': f'Expected model at: {model_path}'
-            }, 404
-        
-        # Load model
-        model, scaler, config = load_lstm_model(model_path)
-        lookback = config['lookback']
-        
-        # Get recent data
-        query = """
-            SELECT date(date) as day, COUNT(*) as count
-            FROM sightings
-        """
-        conditions = []
-        params = []
-        
-        if location:
-            conditions.append("location LIKE ?")
-            params.append(f'%{location}%')
-        if species:
-            conditions.append("species LIKE ?")
-            params.append(f'%{species}%')
-        
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        
-        query += " GROUP BY day ORDER BY day DESC LIMIT ?"
-        params.append(lookback)
-        
-        df = pd.read_sql_query(query, get_db(), params=params)
-        
-        if len(df) < lookback:
-            return {
-                'error': f'Insufficient recent data (have {len(df)} days, need {lookback})'
-            }, 400
-        
-        # Get last sequence (reverse order since we selected DESC)
-        last_sequence = df['count'].values[::-1]
-        
-        # Get last date
-        df['day'] = pd.to_datetime(df['day'])
-        last_date = df['day'].max()
-        
-        # Predict future
-        import torch
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        predictions = predict_future(model, scaler, last_sequence, forecast_days, device)
-        
-        # Format response
-        forecast_data = []
-        for i, pred_count in enumerate(predictions):
-            forecast_date = last_date + timedelta(days=i+1)
-            forecast_data.append({
-                'date': forecast_date.strftime(DATE_FORMAT),
-                'predicted_count': max(0, round(float(pred_count), 2)),
-                'confidence': 'high' if i < 7 else 'medium' if i < 14 else 'low'
-            })
-        
-        return {
-            'location': location or 'all',
-            'species': species or 'all',
-            'forecast_days': forecast_days,
-            'model_type': 'LSTM',
-            'model_config': config,
-            'forecast': forecast_data,
-            'metadata': {
-                'last_actual_date': last_date.strftime(DATE_FORMAT),
-                'last_actual_count': int(last_sequence[-1]),
-                'model_path': model_path
-            }
-        }
-        
-    except Exception as e:
-        return {'error': str(e)}, 500
-
-
-@app.route('/ml/evaluate', methods=['GET'])
-def evaluate_lstm():
-    """Evaluate trained LSTM model performance."""
-    location = request.args.get('location')
-    species = request.args.get('species')
-    
-    try:
-        model_path = f'models/lstm_{location or "all"}_{species or "all"}.pth'
-        
-        if not os.path.exists(model_path):
-            return {'error': 'Model not found'}, 404
-        
-        # Load model
-        model, scaler, config = load_lstm_model(model_path)
-        
-        # This would require re-loading and splitting the training data
-        # For simplicity, return model info
-        return {
-            'model_path': model_path,
-            'config': config,
-            'status': 'Model evaluation would require re-running training data split'
-        }
-        
-    except Exception as e:
-        return {'error': str(e)}, 500
-
+  
 
 if __name__ == "__main__":
     if not os.path.exists(DATABASE):
